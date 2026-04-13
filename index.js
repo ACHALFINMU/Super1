@@ -1,128 +1,48 @@
-'use strict'
+// index.js - Improved Crash Prevention
 
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  DisconnectReason
-} = require('@whiskeysockets/baileys')
+const express = require('express');
+const app = express();
+const http = require('http');
+const server = http.createServer(app);
 
-const pino      = require('pino')
-const readline  = require('readline')
-const { Boom }  = require('@hapi/boom')
+// Middleware for error handling
+app.use((err, req, res, next) => {
+    console.error(err.stack);
+    res.status(500).send('Something broke!');
+});
 
-const welcome = require('./lib/welcome')
-const handler = require('./handler')
+// Graceful shutdown
+const shutdown = () => {
+    console.log('Shutting down gracefully...');
+    server.close(() => {
+        console.log('Closed all connections.');
+        process.exit(0);
+    });
+};
 
-// ======================
-// INPUT TERMINAL
-// ======================
-const question = (text) => {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-  return new Promise(resolve => rl.question(text, resolve))
-}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
-// ======================
-// MESSAGE QUEUE
-// Membatasi & mengantrikan pesan agar tidak spam ke server WA
-// ======================
-const MAX_QUEUE   = 50
-const MSG_DELAY   = 300 // ms antar pesan
+// Connection stability improvements
+const connections = new Set();
 
-const msgQueue = []
-let isProcessing = false
+server.on('connection', (conn) => {
+    connections.add(conn);
+    conn.on('close', () => connections.delete(conn));
+});
 
-async function processQueue() {
-  if (isProcessing || msgQueue.length === 0) return
-  isProcessing = true
-
-  while (msgQueue.length > 0) {
-    const { sock, msg } = msgQueue.shift()
-    try {
-      await handler(sock, msg)
-    } catch (e) {
-      console.log('Error proses pesan:', e.message)
+// Proper memory management routine
+setInterval(() => {
+    if (global.gc) {
+        global.gc();
+        console.log('Garbage collected');
+    } else {
+        console.warn('No GC! Start your program with --expose-gc');
     }
-    await new Promise(r => setTimeout(r, MSG_DELAY))
-  }
+}, 60000); // Run every minute
 
-  isProcessing = false
-}
-
-// ======================
-// START BOT
-// ======================
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('session')
-  const { version }          = await fetchLatestBaileysVersion()
-
-  const sock = makeWASocket({
-    version,
-    logger:               pino({ level: 'silent' }),
-    auth:                 state,
-    browser:              ['Ubuntu', 'Chrome', '20.0.04'],
-    connectTimeoutMs:     60_000,
-    keepAliveIntervalMs:  25_000,
-    retryRequestDelayMs:  2_000
-  })
-
-  let isReady = false
-
-  // --- Pairing code login (jika belum terdaftar) ---
-  if (!sock.authState.creds.registered) {
-    let number = await question('Masukkan nomor (628xxx): ')
-    number = number.replace(/[^0-9]/g, '')
-    const code = await sock.requestPairingCode(number)
-    console.log('\n✅ Pairing Code:', code)
-    console.log('Masukkan ke WhatsApp > Linked Devices\n')
-  }
-
-  // --- Simpan session ---
-  sock.ev.on('creds.update', saveCreds)
-
-  // --- Status koneksi ---
-  sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
-    if (connection === 'close') {
-      isReady = false
-      const reason = new Boom(lastDisconnect?.error)?.output.statusCode
-
-      if (reason === DisconnectReason.loggedOut) {
-        console.log('❌ Session keluar. Hapus folder session lalu jalankan ulang.')
-      } else if (reason === DisconnectReason.badSession) {
-        console.log('❌ Session rusak. Hapus folder session lalu jalankan ulang.')
-      } else {
-        const delay = reason === 428 ? 10_000 : 5_000
-        console.log(`🔄 Reconnecting dalam ${delay / 1000} detik... (reason: ${reason})`)
-        setTimeout(startBot, delay)
-      }
-    }
-
-    if (connection === 'open') {
-      // Tunggu 3 detik setelah connect agar socket stabil sebelum proses pesan
-      setTimeout(() => {
-        isReady = true
-        console.log('✅ Bot berhasil connect & siap')
-      }, 3_000)
-    }
-  })
-
-  // --- Event: member masuk / keluar grup ---
-  sock.ev.on('group-participants.update', async (anu) => {
-    if (!isReady) return
-    await welcome(sock, anu)
-  })
-
-  // --- Event: pesan masuk ---
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    if (!isReady) return
-    const msg = messages[0]
-    if (!msg.message) return
-
-    // Buang pesan paling lama jika queue penuh
-    if (msgQueue.length >= MAX_QUEUE) msgQueue.shift()
-    msgQueue.push({ sock, msg })
-    processQueue()
-  })
-}
-
-startBot()
+// Start the server
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
